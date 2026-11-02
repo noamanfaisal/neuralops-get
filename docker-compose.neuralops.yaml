@@ -1,0 +1,669 @@
+# =============================================================================
+# docker-compose.neuralops.yaml — the new unified-image stack. Separate from
+# docker-compose.yaml (the existing dev/fat split), which is untouched.
+#
+# One shared image (`neuralops`) contains nucleus + nexus-ai + centrifugo +
+# the filesystem MCP — see neuralops/Dockerfile. Each is its own
+# service/container here, distinguished only by `command:`. Postgres (the
+# pgvector build — it carries the vector store since Step 8a; chromadb is
+# gone from BOTH profiles), redis and nginx stay separate, using their
+# official images.
+#
+# Two profiles:
+#   production (default) — pulls the neuralops image from Docker Hub, no
+#     build, no source tree required. This is what COMPOSE_PROFILES defaults
+#     to in neuralops/infra.env.example.
+#   dev — builds the neuralops image locally, then bind-mounts
+#     modules/nexus-nucleus and modules/nexus-ai over the baked-in code paths
+#     for live editing. Infra (postgres/redis/chromadb/nginx) is still
+#     pulled, not rebuilt, in dev too.
+#
+# Secrets note: SUPABASE_*, NEURALOPS_PORTAL_URL, and NEURALOPS_VERSION are
+# deliberately NOT set anywhere in this file — they're baked into the
+# neuralops image itself (see neuralops/Dockerfile), one shared default for
+# every deployment (SUPABASE_URL/ANON_KEY genuinely are shared -- one real
+# Supabase project every deployment's login talks to). There is also no
+# OPENAI_API_KEY/ANTHROPIC_API_KEY anywhere in this file on purpose — no
+# shared default exists for those, ever; nucleus's /add-model UI is the
+# real path for those, not an env var.
+#
+# FIELD_ENCRYPTION_KEY, INTERNAL_API_KEY, CENTRIFUGO_API_KEY,
+# CENTRIFUGO_HMAC_SECRET, and POSTGRES_PASSWORD are the opposite: genuinely
+# per-deployment secrets, generated ONCE per deployment before first run:
+#
+#   docker run --rm ${NEURALOPS_IMAGE:-noamanfaisal/neuralops:latest} init-secrets > neuralops/secrets.env
+#
+# POSTGRES_PASSWORD joined this list to close a real gap: infra.env.example
+# used to ship a literal example password, and with no generator, nothing
+# stopped every self-hosted deployment from sharing that same value — worse,
+# postgres publishes a host port, so a shared password wasn't just a
+# theoretical risk. POSTGRES_DB/POSTGRES_USER stay in infra.env — plain
+# identifiers, not secrets, safe to leave as shared defaults or change by
+# hand for minor extra hardening.
+#
+# Reliability note: every app service that needs any of these five values
+# (nucleus, nucleus-celery, nucleus-celery-beat, nexus-ai, centrifugo,
+# postgres, and their -dev counterparts) loads neuralops/secrets.env
+# directly via its own `env_file:` key below, not through ${VAR} references.
+# This means these values get loaded at container-creation time regardless
+# of what flags anyone types on the `up` command line — a forgotten
+# --env-file neuralops/secrets.env flag can no longer silently leave them
+# blank (Compose would otherwise just warn and substitute an empty string,
+# which surfaces later as a confusing auth failure, not an obvious error).
+# One accepted trade-off: nexus-ai receives all five secrets this way even
+# though it only uses INTERNAL_API_KEY directly — env_file: loads a whole
+# file, not individual keys — and nexus-ai spawns MCP server subprocesses,
+# which inherit their parent's environment by default. Chosen deliberately
+# in favor of consistent reliability across every service; splitting
+# secrets.env into a smaller per-service file is the way to get both
+# precision and reliability later, if that trade-off ever needs revisiting.
+# Because every consumer now reads this file via env_file: rather than
+# ${VAR} interpolation, --env-file neuralops/secrets.env in the run command
+# below is technically redundant now — kept anyway, harmless, and keeps the
+# command self-documenting.
+#
+# NEURALOPS_SERVER_URL note (production only -- dev still uses ${VAR}, see
+# below): this hit the exact same reliability gap as the five secrets above
+# -- nucleus and centrifugo used to read it via ${NEURALOPS_SERVER_URL}
+# interpolation, so a `docker compose up`/`create` run without
+# --env-file neuralops/app.env in scope silently left it blank instead of
+# erroring. Fixed the same way: nucleus now loads neuralops/app.env directly
+# via env_file: (same variable name on both sides, so no extra step needed).
+# centrifugo is trickier -- nexus-transport reads the config key as
+# CENTRIFUGO_ALLOWED_ORIGINS, a DIFFERENT name than NEURALOPS_SERVER_URL, and
+# env_file: can only load a variable under its own name, not rename it (only
+# ${VAR} interpolation can remap names, which is the exact fragility being
+# removed here). So app.env now also carries an explicit
+# CENTRIFUGO_ALLOWED_ORIGINS line -- same value as NEURALOPS_SERVER_URL, set
+# once by hand in neuralops/app.env, not derived -- and centrifugo loads
+# app.env via env_file: too. Keep the two values identical when either one
+# changes; see the comment in neuralops/app.env.example.
+#
+# Project files note: nexus-ai's /nexus/projects is a BIND MOUNT to ./projects
+# (repo root, sibling to this file), not a named volume — deliberately, so a
+# self-hoster can see, edit, and back up their actual project files/code as
+# a normal folder instead of hunting through Docker's internal volume
+# storage. postgres/redis/chromadb/fastembed-cache data stay as named
+# volumes; only projects changed. This has one real consequence: nexus-ai
+# runs as a non-root user (UID 1000, the `nexus` user baked into the image —
+# see neuralops/Dockerfile's `ARG UID=1000`) with no privileges to fix
+# directory ownership itself at startup, unlike named volumes (which inherit
+# the image's own ownership on first mount) or the official postgres image
+# (whose entrypoint runs as root initially and fixes its own data directory
+# ownership). A bind-mounted host folder gets none of that — whatever
+# ownership it has on the host is exactly what the container sees. Create
+# and own it BEFORE the first `up`:
+#
+#   mkdir -p ./projects
+#   sudo chown -R 1000:1000 ./projects
+#
+# Skipping this isn't fatal but is confusing: Compose will auto-create
+# ./projects as root-owned if it doesn't exist, and nexus-ai will then fail
+# to write into it — fixable after the fact by running the same chown
+# command and restarting the nexus-ai container, but doing it up front
+# avoids hitting that failure at all. ./projects is git-ignored (see
+# .gitignore) since it holds real project files/code, never repo content.
+#
+# Run with (see neuralops/app.env.example + neuralops/infra.env.example —
+# copy both to neuralops/app.env + neuralops/infra.env first, filled in with
+# real values. NOT the repo's existing .env, which belongs to the old
+# docker-compose.yaml and would collide on COMPOSE_PROFILES/DEV_* var names
+# if auto-loaded here):
+#
+#   docker compose -f docker-compose.neuralops.yaml \
+#     --env-file neuralops/infra.env --env-file neuralops/app.env \
+#     --env-file neuralops/secrets.env up -d
+#
+# Same internal-DNS rule as docker-compose.yaml: containers resolve each
+# other by Compose *service name* only, never container_name — every
+# internal URL below is a service name on purpose.
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  # PRODUCTION profile — pulled image, no build, no source tree needed.
+  # ===========================================================================
+
+  nucleus:
+    image: ${NEURALOPS_IMAGE:-noamanfaisal/neuralops:latest}
+    profiles: ["production"]
+    container_name: neuralops-nucleus
+    command: ["nucleus-env", "uvicorn", "core.asgi:application", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    # Comes back by itself after a reboot (it had no restart policy before
+    # 2026-10-24 — the database returned after a reboot, the app did not).
+    restart: unless-stopped
+    volumes:
+      # Same bind mount nexus-ai uses -- nucleus creates each project's
+      # subfolder here (settings.PROJECTS_ROOT), nexus-ai is what actually
+      # runs the filesystem MCP server against it. Must be the SAME mount as
+      # nexus-ai's below or nucleus's created folders are invisible to it.
+      - ./projects:/nexus/projects
+    env_file:
+      - ./neuralops/secrets.env
+      - ./neuralops/app.env
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - REDIS_URL=redis://redis:6379/0
+      - NEXUS_AI_URL=http://nexus-ai:8000
+      - CENTRIFUGO_API_URL=http://centrifugo:8000/api
+    networks:
+      - neuralops-network
+    depends_on:
+      - postgres
+      - redis
+      - centrifugo
+
+  nucleus-celery:
+    image: ${NEURALOPS_IMAGE:-noamanfaisal/neuralops:latest}
+    profiles: ["production"]
+    container_name: neuralops-nucleus-celery
+    command: ["nucleus-env", "celery", "-A", "core", "worker", "-l", "info"]
+    restart: unless-stopped
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - REDIS_URL=redis://redis:6379/0
+      - NEXUS_AI_URL=http://nexus-ai:8000
+      - CENTRIFUGO_API_URL=http://centrifugo:8000/api
+    networks:
+      - neuralops-network
+    depends_on:
+      - postgres
+      - redis
+
+  nucleus-celery-beat:
+    image: ${NEURALOPS_IMAGE:-noamanfaisal/neuralops:latest}
+    profiles: ["production"]
+    container_name: neuralops-nucleus-celery-beat
+    command: ["nucleus-env", "celery", "-A", "core", "beat", "-l", "info"]
+    restart: unless-stopped
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - REDIS_URL=redis://redis:6379/0
+    networks:
+      - neuralops-network
+    depends_on:
+      - postgres
+      - redis
+
+  # The REBUILT engine (Step 8's distribution half, done 2026-10-22 with the
+  # 1.0.0 release): fastapi_app.main, vectors on the SAME pgvector postgres
+  # nucleus uses (database nexus_vectors — created once at setup, see the
+  # readme). NO host port on purpose — the engine accepts nothing from
+  # outside; the internal key (secrets.env) is the second lock. Same rule as
+  # dev's nexus-ai-new.
+  nexus-ai:
+    image: ${NEURALOPS_IMAGE:-noamanfaisal/neuralops:latest}
+    profiles: ["production"]
+    container_name: neuralops-nexus-ai
+    command: ["nexus-ai-env", "python3", "-m", "uvicorn", "fastapi_app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    volumes:
+      # The whole .cache (fastembed + huggingface), same as dev — without it
+      # every recreate re-downloads the embedding model.
+      - neuralops_fastembed_cache:/home/nexus/.cache
+      - ./projects:/nexus/projects
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      - NEXUS_NUCLEUS_URL=http://nucleus:8000
+      # Empty URL = vectors off (embed endpoints answer 503) — a missing
+      # secrets.env shows up loudly, not silently. Same DSN shape as dev.
+      - NEXUS_VECTOR_DB_URL=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/nexus_vectors
+    networks:
+      - neuralops-network
+    depends_on:
+      - postgres
+      - nucleus
+
+  centrifugo:
+    image: ${NEURALOPS_IMAGE:-noamanfaisal/neuralops:latest}
+    profiles: ["production"]
+    container_name: neuralops-centrifugo
+    command: ["centrifugo", "nexus-transport", "--admin.enabled", "--admin.insecure", "--client.insecure", "--http_api.insecure"]
+    restart: unless-stopped
+    env_file:
+      - ./neuralops/secrets.env
+      - ./neuralops/app.env
+    networks:
+      - neuralops-network
+    depends_on:
+      - redis
+
+  postgres:
+    # pgvector/pgvector = official postgres 17 + the pgvector extension baked
+    # in — the engine's vector store lives here (database nexus_vectors).
+    # Swapped from postgres:17-alpine with the 1.0.0 release; same PG major,
+    # same data volume. An EXISTING deployment that upgrades needs the same
+    # one-time follow-ups dev did: REINDEX DATABASE (musl→glibc collation),
+    # then CREATE DATABASE nexus_vectors + CREATE EXTENSION vector in it.
+    image: pgvector/pgvector:0.8.7-pg17
+    profiles: ["production"]
+    container_name: neuralops-postgres
+    restart: always
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+    # Host port bound to THIS machine only by default (2026-10-24): on an
+    # internet-facing server a published database port is reachable by
+    # anyone, and Docker's published ports bypass the host firewall. Set
+    # POSTGRES_BIND=0.0.0.0 in infra.env only if you truly need remote access.
+    ports:
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_HOST_PORT:-5495}:5432"
+    volumes:
+      - neuralops_postgres_data:/var/lib/postgresql/data
+    networks:
+      - neuralops-network
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["production"]
+    container_name: neuralops-redis
+    restart: unless-stopped
+    # This machine only, same reason as postgres — and redis has no password.
+    ports:
+      - "${REDIS_BIND:-127.0.0.1}:${REDIS_HOST_PORT:-6395}:6379"
+    volumes:
+      - neuralops_redis_data:/data
+    networks:
+      - neuralops-network
+
+  # chromadb is GONE from the production profile too (Step 8a: vectors live
+  # in pgvector postgres). The old neuralops_chroma_data volume is left
+  # defined below so an existing deployment's data is not orphaned silently;
+  # remove it by hand once an upgraded deployment is confirmed healthy.
+
+  nginx:
+    image: nginx:alpine
+    profiles: ["production"]
+    container_name: neuralops-nginx
+    restart: unless-stopped
+    # NGINX_BIND: 0.0.0.0 (default) serves the LAN; the one-command installer
+    # sets 127.0.0.1 because Caddy (domain mode) or Tailscale (machine level)
+    # fronts it and nothing else should reach it in the clear.
+    ports:
+      - "${NGINX_BIND:-0.0.0.0}:${NGINX_HOST_PORT:-8095}:80"
+    volumes:
+      - ./neuralops/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - neuralops-network
+    depends_on:
+      - nucleus
+      - centrifugo
+
+  # ── One-command installer (install.sh) — how the outside world reaches nginx.
+  # For domain installs, the "https" profile starts Caddy below; for Tailscale,
+  # Tailscale runs on the host machine itself (not in compose).
+  #
+  # https: the server has a domain → Caddy fetches and renews a real
+  # certificate by itself (ports 80 + 443) and passes everything to nginx,
+  # websockets included. NEURALOPS_DOMAIN comes from infra.env.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    container_name: neuralops-caddy
+    restart: unless-stopped
+    command: ["caddy", "reverse-proxy", "--from", "${NEURALOPS_DOMAIN:-localhost}", "--to", "nginx:80"]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - neuralops_caddy_data:/data
+      - neuralops_caddy_config:/config
+    networks:
+      - neuralops-network
+    depends_on:
+      - nginx
+
+  # ===========================================================================
+  # DEV profile — image built locally, app code bind-mounted over the baked-in
+  # copy for live editing. Infra still pulled, not rebuilt.
+  # NOTE: dev profile deliberately left untouched by the env_file: hardening
+  # passes (secrets and NEURALOPS_SERVER_URL both) -- tracked separately.
+  # ===========================================================================
+
+  nucleus-dev:
+    # The ONE place the shared dev image is built (owner's call, 2026-10-15:
+    # one build, not five). Every other dev app service below just says
+    # `image: neuralops:dev-local` with no build: key — compose builds here
+    # first, then they all start from the same finished image.
+    build:
+      context: .
+      dockerfile: neuralops/Dockerfile
+    image: neuralops:dev-local
+    profiles: ["dev"]
+    container_name: neuralops-nucleus-dev
+    command: ["nucleus-env", "uvicorn", "core.asgi:application", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # command: ["nucleus-env", "tail", "-f", "/dev/null"]
+    volumes:
+      - ./modules/nexus-nucleus:/nexus/nucleus
+      # Bind mount, not a named volume -- same ./projects folder production
+      # uses (repo root, sibling to this file), so dev project files are
+      # visible/editable on the host too, not hidden inside Docker's
+      # internal volume storage. Must match nexus-ai-dev's mount below
+      # exactly -- see PROJECTS_ROOT's comment in core/settings.py.
+      - ./projects:/nexus/projects
+      - /data/mcp-keys:/nexus/keys:ro
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      - POSTGRES_HOST=postgres-dev
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - REDIS_URL=redis://redis-dev:6379/0
+      # STEP 8 SWITCH-OVER (docs/NUCLEUS-REVAMP.md): dev talks to the
+      # REBUILT engine. The legacy service is gone from this branch.
+      - NEXUS_AI_URL=http://nexus-ai-new:8000
+      - CENTRIFUGO_API_URL=http://centrifugo-dev:8000/api
+      # Hardcoded, NOT ${NEURALOPS_SERVER_URL} -- that variable comes from
+      # neuralops/app.env, which is shared with the PRODUCTION nucleus/
+      # centrifugo services (both load it via env_file:). Interpolating it
+      # here would mean editing app.env for dev testing silently changes
+      # production's OAuth redirect_uri and Centrifugo CORS origin too, the
+      # next time production gets recreated. Pinned directly instead --
+      # update this line by hand if the Funnel's proxy target or hostname
+      # ever changes (currently: `tailscale funnel status` shows the single
+      # 443 Funnel entry pointed at localhost:8096, i.e. THIS dev stack --
+      # no separate port in use).
+      - NEURALOPS_SERVER_URL=https://node-3.tail9ed39a.ts.net
+      - NEURALOPS_VERSION=dev
+      # Where create_owner's printed link sends the person to type the claim
+      # code. The image default is the public app (neuralopsnexus.ai/add_code
+      # — see neuralops/Dockerfile); dev points at the locally running web
+      # app instead. Change the host/port here if you run `npm run dev`
+      # somewhere else.
+      - NEURALOPS_PORTAL_URL=http://192.168.1.90:3000/add_code
+      # Step 4 posture: DEBUG now defaults OFF in settings.py. Dev says so
+      # explicitly — this also unlocks the dev-only SECRET_KEY fallback
+      # (production gets SECRET_KEY from secrets.env via init-secrets).
+      - DEBUG=true
+    networks:
+      - neuralops-network
+    depends_on:
+      - postgres-dev
+      - redis-dev
+      - centrifugo-dev
+
+  nucleus-celery-dev:
+    image: neuralops:dev-local   # built once by nucleus-dev above
+    profiles: ["dev"]
+    container_name: neuralops-nucleus-celery-dev
+    command: ["nucleus-env", "celery", "-A", "core", "worker", "-l", "info"]
+    # command: ["nexus-ai-env", "tail", "-f", "/dev/null"]
+    restart: unless-stopped
+    volumes:
+      - ./modules/nexus-nucleus:/nexus/nucleus
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      - POSTGRES_HOST=postgres-dev
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - REDIS_URL=redis://redis-dev:6379/0
+      - NEXUS_AI_URL=http://nexus-ai-new:8000   # Step 8 switch-over — see nucleus-dev
+      - CENTRIFUGO_API_URL=http://centrifugo-dev:8000/api
+      - DEBUG=true   # Step 4 posture — see nucleus-dev's comment
+    networks:
+      - neuralops-network
+    depends_on:
+      - postgres-dev
+      - redis-dev
+
+  nucleus-celery-beat-dev:
+    image: neuralops:dev-local   # built once by nucleus-dev above
+    profiles: ["dev"]
+    container_name: neuralops-nucleus-celery-beat-dev
+    command: ["nucleus-env", "celery", "-A", "core", "beat", "-l", "info"]
+    restart: unless-stopped
+    volumes:
+      - ./modules/nexus-nucleus:/nexus/nucleus
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      - POSTGRES_HOST=postgres-dev
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - REDIS_URL=redis://redis-dev:6379/0
+      - DEBUG=true   # Step 4 posture — see nucleus-dev's comment
+    networks:
+      - neuralops-network
+    depends_on:
+      - postgres-dev
+      - redis-dev
+
+  # STEP 8 SWITCH-OVER (docs/NUCLEUS-REVAMP.md, branch step8-switchover):
+  # the legacy nexus-ai-dev service and chromadb-dev are REMOVED — dev runs
+  # the rebuilt engine only, and its vectors live in postgres (pgvector).
+  # modules/nexus-ai-legacy is deleted from the branch with `git rm` (git
+  # history keeps it). The production profile's nexus-ai/chromadb rows are
+  # rebuilt in Step 8's distribution half, when the unified image itself
+  # changes.
+  #
+  # The REBUILT nexus-ai — runs from the SHARED unified image (owner's
+  # one-image ruling, 2026-10-15: nucleus + engine + centrifugo in ONE
+  # image; the engine's venv inside it is Python 3.13 — see
+  # neuralops/Dockerfile stage 2). The standalone image
+  # (modules/nexus-ai/docker/Dockerfile) is retired for dev. No host port
+  # on purpose — no request from outside is accepted; the internal key
+  # (from secrets.env) is the second lock.
+  nexus-ai-new:
+    image: neuralops:dev-local   # built once by nucleus-dev above
+    profiles: ["dev"]
+    container_name: neuralops-nexus-ai-new
+    command: ["nexus-ai-env", "python3", "-m", "uvicorn", "fastapi_app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # command: ["nexus-ai-env", "tail", "-f", "/dev/null"]   # DEBUG: idle — start the engine by hand (VSCode); swap comments to run normally
+    volumes:
+      - ./modules/nexus-ai:/nexus/ai
+      # The engine's fastembed/huggingface model cache (the image runs as the
+      # `nexus` user, UID 1000) — without this every recreate re-downloads
+      # the embedding model.
+      - neuralops_fastembed_cache_new:/home/nexus/.cache
+      # Same projects mount as nucleus-dev/legacy — the engine's filesystem/
+      # shell capabilities act on each project's folder.
+      - ./projects:/nexus/projects
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      - NEXUS_NUCLEUS_URL=http://nucleus-dev:8000
+      # Step 8: Layer 3 vector stack ON — the nexus_vectors database on the
+      # SAME pgvector postgres nucleus uses (decision 2). sqlalchemy DSN.
+      # Interpolated from infra.env (user) + secrets.env (password): both are
+      # in the standard `up` command's --env-file flags. Empty URL = vectors
+      # off and the embed endpoints answer 503, so a missing flag shows up
+      # loudly, not silently.
+      - NEXUS_VECTOR_DB_URL=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-dev:5432/nexus_vectors
+    networks:
+      - neuralops-network
+    depends_on:
+      - nucleus-dev
+      - postgres-dev
+
+  centrifugo-dev:
+    image: neuralops:dev-local   # built once by nucleus-dev above
+    profiles: ["dev"]
+    container_name: neuralops-centrifugo-dev
+    command: ["centrifugo", "nexus-transport", "--admin.enabled", "--admin.insecure", "--client.insecure", "--http_api.insecure"]
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      # Hardcoded for the same reason as nucleus-dev's NEURALOPS_SERVER_URL
+      # above -- ${NEURALOPS_SERVER_URL} resolves from the shared
+      # neuralops/app.env, which production also loads.
+      - CENTRIFUGO_ALLOWED_ORIGINS=https://node-3.tail9ed39a.ts.net
+    networks:
+      - neuralops-network
+    depends_on:
+      - redis-dev
+
+  # neuralops-web-app (Next.js frontend) -- dev only, per request. Plain
+  # node:22-alpine + bind mount, no Dockerfile build, since dev here just
+  # means "npm install && npm run dev" against live source -- mirrors
+  # modules/neuralops-web-app/docker-compose.yaml's own app-dev service so
+  # behavior is identical whether it's run standalone or from this stack.
+  # Not part of the production profile: that profile is the baked neuralops
+  # image (nucleus/nexus-ai/centrifugo only) and has no frontend baked in --
+  # the web app ships/deploys separately (its own Dockerfile builds a
+  # standalone Next.js production image, see that folder). No NEURALOPS_
+  # SERVER_URL wiring needed here either -- unlike nucleus-dev/centrifugo-
+  # dev above, the frontend doesn't need to know its own public URL at
+  # container start; the NeuralOps server it talks to is chosen at RUNTIME,
+  # in the browser, on the /servers screen (see that module's README).
+  web-app-dev:
+    image: node:22-alpine
+    profiles: ["dev"]
+    container_name: neuralops-web-app-dev
+    working_dir: /app
+    # npm install, not `npm ci` -- picks up package.json changes on restart
+    # without needing a clean lockfile-only install every time. Installs
+    # land in a NAMED volume (below), not the bind mount itself, so a
+    # Linux-built node_modules never collides with a host node_modules.
+    command: sh -c "npm install && npm run dev"
+    ports:
+      - "${DEV_WEB_APP_PORT:-3000}:3000"
+    volumes:
+      - ./modules/neuralops-web-app:/app
+      - neuralops_web_app_node_modules:/app/node_modules
+    environment:
+      # next dev's file watcher is unreliable on bind mounts without
+      # polling -- same fix the module's own docker-compose.yaml uses.
+      - WATCHPACK_POLLING=true
+      # NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY deliberately
+      # NOT set here -- this service bind-mounts the whole module folder
+      # (below), .env.local included, and `next dev` reads .env.local on its
+      # own (Next's built-in convention). Setting them again here would just
+      # be a second place to keep in sync with that file for no benefit.
+      #
+      # NEXT_DEV_ALLOWED_ORIGINS, on the other hand, IS needed here.
+      # next.config.ts auto-allows this host's own LAN IPs via
+      # os.networkInterfaces() -- that works when `next dev` runs directly on
+      # the host, but inside this container networkInterfaces() only sees the
+      # container's own Docker-bridge interface, not the host's real LAN IP
+      # browsers actually hit it on. Set explicitly to unblock cross-origin
+      # dev requests (chunks/HMR) from that IP -- add more, comma-separated,
+      # if this box is reached from other LAN IPs too.
+      - NEXT_DEV_ALLOWED_ORIGINS=192.168.1.90
+    networks:
+      - neuralops-network
+
+  postgres-dev:
+    # pgvector/pgvector = official postgres 17 + the pgvector extension baked
+    # in (Layer 3, docs/NEXUS-AI-REVAMP.md §1.3 vector stack). Swapped from
+    # postgres:17-alpine 2026-10-13; same PG major, same data volume. One-time
+    # follow-ups after the swap: REINDEX DATABASE (musl→glibc collation) and
+    # CREATE EXTENSION vector in the nexus_vectors database.
+    image: pgvector/pgvector:0.8.7-pg17
+    profiles: ["dev"]
+    container_name: neuralops-postgres-dev
+    restart: always
+    env_file:
+      - ./neuralops/secrets.env
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+    ports:
+      - "${DEV_POSTGRES_HOST_PORT:-5496}:5432"
+    volumes:
+      - neuralops_postgres_data_dev:/var/lib/postgresql/data
+    networks:
+      - neuralops-network
+
+  redis-dev:
+    image: redis:7-alpine
+    profiles: ["dev"]
+    container_name: neuralops-redis-dev
+    restart: unless-stopped
+    ports:
+      - "${DEV_REDIS_HOST_PORT:-6396}:6379"
+    volumes:
+      - neuralops_redis_data_dev:/data
+    networks:
+      - neuralops-network
+
+  nginx-dev:
+    image: nginx:alpine
+    profiles: ["dev"]
+    container_name: neuralops-nginx-dev
+    restart: unless-stopped
+    ports:
+      - "${DEV_NGINX_HOST_PORT:-8096}:80"
+    volumes:
+      - ./neuralops/nginx.dev.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - neuralops-network
+    depends_on:
+      - nucleus-dev
+      - centrifugo-dev
+  # web-app-dev:
+  #   image: node:22-alpine
+  #   profiles: ["dev"]
+  #   container_name: neuralops-web-app-dev
+  #   working_dir: /app
+  #   # npm install, not `npm ci` -- picks up package.json changes on restart
+  #   # without needing a clean lockfile-only install every time. Installs
+  #   # land in a NAMED volume (below), not the bind mount itself, so a
+  #   # Linux-built node_modules never collides with a host node_modules.
+  #   command: sh -c "npm install && npx next dev -H 0.0.0.0"
+  #   ports:
+  #     - "${DEV_WEB_APP_PORT:-3000}:3000"
+  #   volumes:
+  #     - ./modules/neuralops-web-app:/app
+  #     - neuralops_web_app_node_modules:/app/node_modules
+  #   env_file:
+  #     - ./modules/neuralops-web-app/.env.local
+  #   environment:
+  #     # next dev's file watcher is unreliable on bind mounts without
+  #     # polling -- same fix the module's own docker-compose.yaml uses.
+  #     - WATCHPACK_POLLING=true
+  #     # NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY deliberately
+  #     # NOT set here -- this service bind-mounts the whole module folder
+  #     # (below), .env.local included, and `next dev` reads .env.local on its
+  #     # own (Next's built-in convention). Setting them again here would just
+  #     # be a second place to keep in sync with that file for no benefit.
+  #     #
+  #     # NEXT_DEV_ALLOWED_ORIGINS, on the other hand, IS needed here.
+  #     # next.config.ts auto-allows this host's own LAN IPs via
+  #     # os.networkInterfaces() -- that works when `next dev` runs directly on
+  #     # the host, but inside this container networkInterfaces() only sees the
+  #     # container's own Docker-bridge interface, not the host's real LAN IP
+  #     # browsers actually hit it on. Set explicitly to unblock cross-origin
+  #     # dev requests (chunks/HMR) from that IP -- add more, comma-separated,
+  #     # if this box is reached from other LAN IPs too.
+  #     - NEXT_DEV_ALLOWED_ORIGINS=0.0.0.0
+  #   networks:
+  #     - neuralops-network
+
+networks:
+  neuralops-network:
+    name: neuralops-network
+    driver: bridge
+
+volumes:
+  neuralops_postgres_data:
+  neuralops_redis_data:
+  neuralops_chroma_data:
+  neuralops_fastembed_cache:
+  neuralops_caddy_data:
+  neuralops_caddy_config:
+  neuralops_postgres_data_dev:
+  neuralops_redis_data_dev:
+  neuralops_fastembed_cache_new:
+  neuralops_projects_dev:
+  neuralops_web_app_node_modules:
