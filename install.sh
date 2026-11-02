@@ -88,6 +88,9 @@ NEURALOPS_TS_AUTHKEY="${NEURALOPS_TS_AUTHKEY:-}"
 NEURALOPS_TS_HOSTNAME="${NEURALOPS_TS_HOSTNAME:-neuralops}"
 NEURALOPS_YES="${NEURALOPS_YES:-}"
 NEURALOPS_PUBLIC_IP="${NEURALOPS_PUBLIC_IP:-}"
+# Where Caddy (ports 80/443) listens: all addresses, unless another program
+# holds 80/443 on a DIFFERENT address (see web_ports_free).
+CADDY_BIND="${CADDY_BIND:-0.0.0.0}"
 # The free-address service (portal/supabase/functions/claim-address).
 NEURALOPS_ADDRESS_URL="${NEURALOPS_ADDRESS_URL:-https://xgfsxikypxjhqlutiepw.supabase.co/functions/v1/claim-address}"
 # Supabase's PUBLIC anon key (the same one baked into every image and the web
@@ -281,6 +284,41 @@ is_port_busy() {
   fi
 }
 
+# The address this machine's internet traffic leaves from (on a cloud server
+# behind 1:1 NAT, like AWS, the private address its public IP forwards to).
+main_ip() {
+  ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1
+}
+
+# Ports 80 + 443 for Caddy. Taken for us = something holds them on ALL
+# addresses or on the main address. Held only on ANOTHER address (Tailscale's
+# own 443 on its 100.x address, say) = still usable: Caddy then listens on the
+# main address only (CADDY_BIND), which is where the public traffic arrives.
+web_ports_free() {
+  CADDY_BIND="0.0.0.0"
+  if ! command -v ss >/dev/null 2>&1; then
+    if is_port_busy 80 || is_port_busy 443; then return 1; fi
+    return 0
+  fi
+  local p addrs main held_all=0 held_other=0
+  main="$(main_ip)"
+  for p in 80 443; do
+    addrs="$(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -E ":${p}\$" || true)"
+    [ -n "$addrs" ] || continue
+    if printf '%s\n' "$addrs" | grep -Eq "^(0\\.0\\.0\\.0|\\*|\\[::\\]|${main//./\\.}):${p}\$"; then
+      held_all=1
+    else
+      held_other=1
+    fi
+  done
+  [ "$held_all" -eq 0 ] || return 1
+  if [ "$held_other" -eq 1 ]; then
+    [ -n "$main" ] || return 1
+    CADDY_BIND="$main"
+  fi
+  return 0
+}
+
 # ── 2. how the team reaches it ───────────────────────────────────────────────
 choose_access() {
   step "How will you reach NeuralOps?"
@@ -298,13 +336,14 @@ choose_access() {
   case "$NEURALOPS_MODE" in
     public)
       $DOCKER rm -f neuralops-claim-check >/dev/null 2>&1 || true  # a stopped earlier run's check
-      if is_port_busy 80 || is_port_busy 443; then
+      if ! web_ports_free; then
         if [ -n "$($DOCKER ps -q --filter "name=neuralops-caddy" 2>/dev/null || true)" ]; then
           $DOCKER stop neuralops-caddy >/dev/null 2>&1 || true
         fi
-        if is_port_busy 80 || is_port_busy 443; then
-          die "Something on this machine already uses port 80 or 443 (another web server?). Stop it, or use option 2 (Tailscale)."
-        fi
+        web_ports_free || die "Something on this machine already uses port 80 or 443 (another web server?). Stop it, or use option 2 (Tailscale)."
+      fi
+      if [ "$CADDY_BIND" != "0.0.0.0" ]; then
+        ok "Ports 80/443 are used elsewhere on another address; NeuralOps will listen on $CADDY_BIND"
       fi
       PROFILES="production,https"
       SERVER_URL=""   # known once the address is claimed
@@ -323,13 +362,11 @@ choose_access() {
       NEURALOPS_DOMAIN="${NEURALOPS_DOMAIN#https://}"
       NEURALOPS_DOMAIN="${NEURALOPS_DOMAIN%%/*}"
       [ -n "$NEURALOPS_DOMAIN" ] || die "A domain is needed for option 2."
-      if is_port_busy 80 || is_port_busy 443; then
+      if ! web_ports_free; then
         if [ -n "$($DOCKER ps -q --filter "name=neuralops-caddy" 2>/dev/null || true)" ]; then
           $DOCKER stop neuralops-caddy >/dev/null 2>&1 || true
         fi
-        if is_port_busy 80 || is_port_busy 443; then
-          die "Something on this machine already uses port 80 or 443 (another web server?). Stop it, or use option 1 (Tailscale)."
-        fi
+        web_ports_free || die "Something on this machine already uses port 80 or 443 (another web server?). Stop it, or use Tailscale."
       fi
       PROFILES="production,https"
       SERVER_URL="https://$NEURALOPS_DOMAIN"
@@ -374,6 +411,8 @@ POSTGRES_USER=neuralops
 NEURALOPS_DOMAIN=${NEURALOPS_DOMAIN}
 # nginx answers on this machine only: Caddy (domain mode) or Tailscale front it.
 NGINX_BIND=127.0.0.1
+# Where Caddy listens for 80/443 (0.0.0.0 = every address).
+CADDY_BIND=${CADDY_BIND}
 EOF
   # The helper reads these back; profiles travel in the shell, never relying
   # on an env file to pick them.
@@ -448,7 +487,7 @@ claim_address() {
     printf '%s' "$token" > "$webroot/.well-known/neuralops-claim/$token"
     chmod -R a+rX "$webroot"
     $DOCKER rm -f neuralops-claim-check >/dev/null 2>&1 || true
-    $DOCKER run -d --rm --name neuralops-claim-check -p 80:80 \
+    $DOCKER run -d --rm --name neuralops-claim-check -p "$CADDY_BIND:80:80" \
       -v "$webroot:/usr/share/nginx/html:ro" nginx:alpine >/dev/null \
       || die "Could not open port 80 on this machine for the address check."
     sleep 2
