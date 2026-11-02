@@ -431,11 +431,10 @@ EOF
   # Secrets: generated ONCE. An existing file is never touched.
   if [ ! -f "$NEURALOPS_DIR/neuralops/secrets.env" ]; then
     # An old database volume WITHOUT its secrets file would refuse the new
-    # password (postgres keeps the one it was created with) — stop and say so
-    # rather than produce a half-working install.
-    if $DOCKER volume inspect neuralops_neuralops_postgres_data >/dev/null 2>&1; then
-      die "An earlier NeuralOps database exists on this machine, but its secrets file is gone, so it cannot be opened. If you don't need that data, remove it with:  $DOCKER volume rm neuralops_neuralops_postgres_data  and run this installer again."
-    fi
+    # password (postgres keeps the one it was created with). Nothing is ever
+    # deleted: the old database is copied into a dated backup volume, and
+    # only then is the original cleared so this install starts fresh.
+    set_aside_old_database neuralops_neuralops_postgres_data
     step "Downloading NeuralOps (a few GB the first time; this takes a few minutes)"
     $DOCKER pull "${NEURALOPS_IMAGE_REPO}:${NEURALOPS_VERSION}"
     ( umask 077
@@ -452,6 +451,32 @@ EOF
     fi
   fi
   ok "Projects folder ready"
+}
+
+set_aside_old_database() {  # <the database volume>
+  local old="$1" backup holders
+  $DOCKER volume inspect "$old" >/dev/null 2>&1 || return 0
+  backup="neuralops_old_postgres_$(date +%Y%m%d-%H%M%S)"
+  warn "An earlier NeuralOps database is on this machine, but its secrets file is gone, so it cannot be opened."
+  say "It will be KEPT as a backup (Docker volume $backup), and this install starts with a fresh database."
+  confirm "Continue?" || die "Stopped. Nothing was changed."
+
+  # A stopped container from that earlier install still holds the volume;
+  # it is recreated below anyway. A RUNNING one means NeuralOps is in use.
+  holders="$($DOCKER ps -aq --filter "volume=$old" 2>/dev/null || true)"
+  if [ -n "$($DOCKER ps -q --filter "volume=$old" 2>/dev/null || true)" ]; then
+    die "That earlier database is in use by a running container ($($DOCKER ps --filter "volume=$old" --format '{{.Names}}' | tr '\n' ' ')). Stop it first, then run this installer again."
+  fi
+
+  $DOCKER volume create "$backup" >/dev/null || die "Could not create the backup volume; nothing was changed."
+  $DOCKER run --rm -v "$old:/from:ro" -v "$backup:/to" alpine:3.20 sh -c 'cp -a /from/. /to/' >/dev/null \
+    || die "Could not copy the earlier database aside; nothing was removed."
+  if [ -n "$holders" ]; then
+    # shellcheck disable=SC2086  # one id per word on purpose
+    $DOCKER rm $holders >/dev/null || die "Could not remove the stopped containers of the earlier install; the database backup is in $backup."
+  fi
+  $DOCKER volume rm "$old" >/dev/null || die "Could not clear the earlier database; it is also backed up in $backup."
+  ok "Earlier database kept as Docker volume $backup (remove it when you no longer need it: docker volume rm $backup)"
 }
 
 write_app_env() {
