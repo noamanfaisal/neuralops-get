@@ -65,7 +65,7 @@ case "$OS_NAME" in
     ;;
 esac
 
-NEURALOPS_VERSION="${NEURALOPS_VERSION:-1.1.0}"
+NEURALOPS_VERSION="${NEURALOPS_VERSION:-1.1.1}"
 NEURALOPS_REF="${NEURALOPS_REF:-main}"
 # The installer's public home: ONLY install.sh, the compose file, the nginx
 # config and the neuralops command — no app code (the code ships compiled in
