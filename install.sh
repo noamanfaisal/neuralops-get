@@ -600,6 +600,9 @@ setup_tailscale() {
   local ts_cmd="tailscale"
   if [ "$OS_FAMILY" = "linux" ] && [ -n "$SUDO" ]; then
     ts_cmd="$SUDO tailscale"
+    # Ask for the password now, in the open: a sudo prompt inside the
+    # background commands below would wait unseen (found live, 2026-11-18).
+    if [ -r /dev/tty ]; then $SUDO -v < /dev/tty || die "Tailscale setup needs sudo."; fi
   fi
 
   if ! command -v tailscale >/dev/null 2>&1; then
@@ -690,6 +693,7 @@ setup_tailscale() {
       ;;
     *)
       if ! $ts_cmd funnel status 2>&1 | grep -q "8095"; then
+        say "Turning on Tailscale Funnel (the public HTTPS address)…"
         local fn_tmp
         fn_tmp="$(mktemp)"
         $ts_cmd funnel --bg 8095 > "$fn_tmp" 2>&1 &
@@ -712,6 +716,14 @@ setup_tailscale() {
           fi
 
           fn_url="$(grep -o 'https://login\.tailscale\.com/[^ ]*' "$fn_tmp" | head -1 || true)"
+          # Funnel gave up with an error and no link: say why instead of waiting 10 minutes.
+          if [ -z "$fn_url" ] && ! kill -0 "$fn_pid" 2>/dev/null \
+             && ! $ts_cmd funnel status 2>&1 | grep -qE "8095|https://"; then
+            echo
+            sed 's/^/    /' "$fn_tmp" >&2
+            rm -f "$fn_tmp"
+            die "Tailscale Funnel did not start (message above). Fix it, or run:  sudo tailscale funnel --bg 8095  — then run this installer again."
+          fi
           if [ -n "$fn_url" ]; then
             echo
             bold "  ┌──────────────────────────────────────────────────────────────┐"
@@ -842,6 +854,35 @@ install_helper() {
   ok "Try: neuralops status"
 }
 
+# ── 6. make the installer the owner (code flow, like a TV sign-in) ───────────
+# The terminal shows a short code; the person types it at neuralopsnexus.ai.
+# Reads the keyboard from /dev/tty, because stdin IS this script under `curl | bash`.
+OWNER_DONE=0
+claim_owner() {
+  if [ -n "$NEURALOPS_OWNER_EMAIL" ]; then return 0; fi
+  local needs
+  # shellcheck disable=SC2086,SC2016
+  needs="$($DOCKER exec -w /nexus/nucleus -e PYTHONPATH=/nexus/nucleus -e DJANGO_SETTINGS_MODULE=core.settings \
+    neuralops-nucleus /opt/venv/nucleus-env/bin/python -c '
+import django; django.setup()
+from authn.services import server_needs_owner
+print("yes" if server_needs_owner() else "no")' 2>/dev/null | tail -n 1 || true)"
+  if [ "$needs" = "no" ]; then OWNER_DONE=1; return 0; fi
+
+  step "Making you the owner of this server"
+  if [ -n "$NEURALOPS_YES" ] || [ ! -r /dev/tty ]; then
+    say "No keyboard here (unattended install). To claim the server later, run:  neuralops setup"
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  if $DOCKER exec -it -w /nexus/nucleus -e PYTHONPATH=/nexus/nucleus neuralops-nucleus \
+      /opt/venv/nucleus-env/bin/python manage.py create_owner < /dev/tty; then
+    OWNER_DONE=1
+  else
+    warn "The server is not claimed yet. Run this anytime to do it:  neuralops setup"
+  fi
+}
+
 finish() {
   local url="$SERVER_URL"
   echo
@@ -860,15 +901,20 @@ finish() {
   fi
   echo
   say "Next:"
-  say "  1. Open  https://neuralopsnexus.ai  and sign in (or create an account)."
-  say "  2. Add a server and paste:  $url"
   if [ -n "$NEURALOPS_OWNER_EMAIL" ]; then
-    say "  3. This server is reserved for $NEURALOPS_OWNER_EMAIL (you become the owner upon sign-in)."
+    say "  1. Open  https://neuralopsnexus.ai  and sign in as $NEURALOPS_OWNER_EMAIL."
+    say "  2. Add a server and paste:  $url"
+    say "     This server is reserved for that email; signing in makes you the owner."
+  elif [ "$OWNER_DONE" -eq 1 ]; then
+    say "  1. Open  https://neuralopsnexus.ai  (signed in with the account you just used)."
+    say "  2. Add a server and paste:  $url"
   else
-    say "  3. The app shows a short code. Claim the server with it; you become its owner."
+    say "  1. Claim the server first:  neuralops setup"
+    say "     (it shows a short code; type it at https://neuralopsnexus.ai)"
+    say "  2. Then add a server in the app and paste:  $url"
   fi
   echo
-  say "Useful commands:  neuralops status | neuralops update | neuralops logs | neuralops backup"
+  say "Useful commands:  neuralops status | neuralops setup | neuralops update | neuralops logs | neuralops backup"
   echo
 }
 
@@ -919,6 +965,7 @@ main() {
   install_helper
   setup_address_sync
   date -u +"%Y-%m-%dT%H:%M:%SZ" > "$NEURALOPS_DIR/neuralops/.installed"
+  claim_owner
   finish
 }
 

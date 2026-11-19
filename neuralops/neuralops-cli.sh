@@ -317,6 +317,13 @@ cmd_update() {
   ok "Updated. Now running $(image)"
 }
 
+cmd_setup() {
+  # Claim ownership: shows a short code to type at neuralopsnexus.ai.
+  [ -r /dev/tty ] || die "neuralops setup needs a terminal (it shows a code and waits)."
+  # shellcheck disable=SC2086
+  $DOCKER exec -it -w /nexus/nucleus -e PYTHONPATH=/nexus/nucleus neuralops-nucleus \
+    /opt/venv/nucleus-env/bin/python manage.py create_owner "$@" < /dev/tty
+}
 cmd_uninstall() {
   local a="" b=""
   read -r -p "  Remove NeuralOps from this server? (y/N): " a < /dev/tty || true
@@ -329,7 +336,7 @@ cmd_uninstall() {
     # volumes in the same compose project with it.
     # shellcheck disable=SC2086
     $DOCKER volume rm -f neuralops_neuralops_postgres_data neuralops_neuralops_redis_data \
-      neuralops_neuralops_fastembed_cache neuralops_neuralops_caddy_data \
+      neuralops_neuralops_catalog neuralops_neuralops_fastembed_cache neuralops_neuralops_caddy_data \
       neuralops_neuralops_caddy_config >/dev/null 2>&1 || true
     if [ "${NEURALOPS_MODE:-}" = "tailscale" ] && command -v tailscale >/dev/null 2>&1; then
       $TS_CMD serve reset >/dev/null 2>&1 || true
@@ -366,6 +373,7 @@ cmd_uninstall() {
 
 case "${1:-help}" in
   status)    cmd_status ;;
+  setup)     shift; cmd_setup "$@" ;;
   address)   shift; cmd_address "${1:-}" ;;
   update)    shift; cmd_update "${1:-latest}" ;;
   backup)    cmd_backup ;;
@@ -380,6 +388,7 @@ case "${1:-help}" in
     say "neuralops: manage this NeuralOps Nexus server"
     echo
     say "  status          what is running, the address, the version"
+    say "  setup           claim this server (shows a code for neuralopsnexus.ai)"
     say "  address         the server's current address"
     say "  update [ver]    back up, then upgrade (default: latest)"
     say "  backup          database + secrets + project files into backups/"
