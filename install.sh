@@ -65,7 +65,7 @@ case "$OS_NAME" in
     ;;
 esac
 
-NEURALOPS_VERSION="${NEURALOPS_VERSION:-1.1.9}"
+NEURALOPS_VERSION="${NEURALOPS_VERSION:-1.1.10}"
 NEURALOPS_REF="${NEURALOPS_REF:-main}"
 # The installer's public home: ONLY install.sh, the compose file, the nginx
 # config and the neuralops command — no app code (the code ships compiled in
@@ -687,12 +687,17 @@ setup_tailscale() {
     fi
   fi
 
+  # Read ALL of `funnel status` before matching. `grep -q` stops at the first
+  # match; tailscale then dies writing the rest (SIGPIPE) and, under pipefail,
+  # a funnel that IS on reads as off (found live on node3, 2026-11-18).
+  funnel_on() { local out; out="$($ts_cmd funnel status 2>&1 || true)"; printf '%s\n' "$out" | grep -qE "${1:-8095|https://}"; }
+
   case "$NEURALOPS_TS_REACH" in
     serve)
       $ts_cmd serve --bg 8095 >/dev/null 2>&1 || die "Tailscale serve failed."
       ;;
     *)
-      if ! $ts_cmd funnel status 2>&1 | grep -q "8095"; then
+      if ! funnel_on "8095"; then
         say "Turning on Tailscale Funnel (the public HTTPS address)…"
         local fn_tmp
         fn_tmp="$(mktemp)"
@@ -711,14 +716,14 @@ setup_tailscale() {
             die "Waiting for the Tailscale sign-in timed out. Run the installer again; it will continue where it stopped."
           fi
 
-          if $ts_cmd funnel status 2>&1 | grep -qE "8095|https://"; then
+          if funnel_on; then
             break
           fi
 
           fn_url="$(grep -o 'https://login\.tailscale\.com/[^ ]*' "$fn_tmp" | head -1 || true)"
           # Funnel gave up with an error and no link: say why instead of waiting 10 minutes.
           if [ -z "$fn_url" ] && ! kill -0 "$fn_pid" 2>/dev/null \
-             && ! $ts_cmd funnel status 2>&1 | grep -qE "8095|https://"; then
+             && ! funnel_on; then
             echo
             sed 's/^/    /' "$fn_tmp" >&2
             rm -f "$fn_tmp"
@@ -741,7 +746,7 @@ setup_tailscale() {
                 echo
                 die "Waiting for the Tailscale sign-in timed out. Run the installer again; it will continue where it stopped."
               fi
-              if $ts_cmd funnel status 2>&1 | grep -qE "8095|https://"; then
+              if funnel_on; then
                 echo
                 break
               fi
@@ -774,8 +779,38 @@ wait_for() {  # wait_for "what" seconds command...
   die "Timed out waiting for $what. See: neuralops logs"
 }
 
+check_leftover_network() {
+  # A neuralops-network left by an older stack (a different compose project,
+  # or one made by hand) makes `compose up` refuse: "a network with name
+  # neuralops-network exists but was not created for project 'neuralops'"
+  # (found live on reinstall, 2026-11-20).
+  local label
+  # shellcheck disable=SC2086  # $DOCKER is "docker" or "sudo docker" on purpose
+  label="$($DOCKER network inspect neuralops-network --format '{{ index .Labels "com.docker.compose.project" }}' 2>/dev/null)" || return 0
+  if [ "$label" = "neuralops" ]; then return 0; fi
+  local attached
+  # shellcheck disable=SC2086
+  attached="$($DOCKER network inspect neuralops-network --format '{{ len .Containers }}' 2>/dev/null || echo 1)"
+  if [ "$attached" = "0" ]; then
+    # Nothing uses it: removing is safe, and compose recreates it its own way.
+    # shellcheck disable=SC2086
+    if $DOCKER network rm neuralops-network >/dev/null 2>&1; then
+      ok "Removed a neuralops-network left by an older install"
+    else
+      die "A leftover Docker network is in the way. Remove it, then run this installer again:  docker network rm neuralops-network"
+    fi
+  else
+    warn "A Docker network named neuralops-network exists from an older install,"
+    warn "and containers are still attached to it. Stop or remove those containers"
+    warn "(docker network inspect neuralops-network shows them), then run:"
+    say  "    docker network rm neuralops-network"
+    die "Remove the leftover neuralops-network, then run this installer again."
+  fi
+}
+
 first_run_setup() {
   step "Starting NeuralOps"
+  check_leftover_network
   compose up -d postgres redis nucleus
   ok "Core services started"
 
@@ -875,8 +910,10 @@ print("yes" if server_needs_owner() else "no")' 2>/dev/null | tail -n 1 || true)
     return 0
   fi
   # shellcheck disable=SC2086
+  # --no-input: take the default workspace name instead of stopping at a
+  # prompt nobody noticed (found live, 2026-11-20); it's editable in the app.
   if $DOCKER exec -it -w /nexus/nucleus -e PYTHONPATH=/nexus/nucleus neuralops-nucleus \
-      /opt/venv/nucleus-env/bin/python manage.py create_owner < /dev/tty; then
+      /opt/venv/nucleus-env/bin/python manage.py create_owner --no-input < /dev/tty; then
     OWNER_DONE=1
   else
     warn "The server is not claimed yet. Run this anytime to do it:  neuralops setup"

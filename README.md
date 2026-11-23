@@ -2,6 +2,8 @@
 
 **A self-hosted team workspace where your people and AI personas with real tools work side by side.**
 
+![NeuralOps Nexus in action: an AI persona works with MCP tools and nothing is saved until a person clicks Allow](docs/demo.gif)
+
 `@mention` a persona in any channel like a colleague. It answers with a plain LLM, or it uses real tools through MCP servers (your code graph, files, the web, GitHub, Jira, Postgres and more), with approval gates you control. It all runs on your server, with your data and your own model keys.
 
 > **Licence:** NeuralOps Nexus is free to self-host. It ships as a compiled Docker image; the source code is not public yet. We plan to publish it under a source-available licence as the project grows. Our MCP servers [contextgraph](https://github.com/mapax-io/contextgraph) and csv-mcp are open source (Apache-2.0).
